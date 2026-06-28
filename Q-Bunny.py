@@ -5,6 +5,7 @@ import sys
 import time
 from collections import defaultdict, deque
 import csv
+import os
 
 # CONSTANTS
 # Colors (earthy / natural palette)
@@ -32,8 +33,8 @@ TRAIN_EPISODES_EASY   = 500    # Easy:   small state space, fast convergence
 TRAIN_EPISODES_MEDIUM = 500   # Medium: walls + wolf, needs more exploration
 TRAIN_EPISODES_HARD   = 500   # Hard:   largest grid, most complex dynamics
 REPLAY_EPISODES  = 3      # how many best-policy runs to show
-MAX_STEPS        = 200    # max steps per episode
-WOLF_MOVE_EVERY  = 3      # wolf moves every N agent steps
+SAFETY_STEP_CAP  = 300    # outer loop safety net only; should never be reached —
+                          # each level enforces its own real episode length via self.max_steps
 
 # Pygame layout
 PANEL_WIDTH      = 280
@@ -137,6 +138,7 @@ class EasyLevel(Level):
     def __init__(self):
         super().__init__()
         self.grid_size   = self.GRID
+        self.max_steps   = 60   # ~7.5x worst-case Manhattan distance (8), matching Medium/Hard's headroom ratio
         self._snake_path = self._build_snake_path()  # 25 cells, no walls
         self._snake_idx  = -1   # first reset() advances to index 0 → (0,0)
 
@@ -176,7 +178,7 @@ class EasyLevel(Level):
             reward   = 10
             self.done = True
 
-        if self.step_count >= MAX_STEPS:
+        if self.step_count >= self.max_steps:
             self.done = True
 
         return self.get_state(), reward, self.done
@@ -227,7 +229,8 @@ class MediumLevel(Level):
         for r in range(self.grid_size):
             cols = range(self.grid_size) if r % 2 == 0 else range(self.grid_size - 1, -1, -1)
             for c in cols:
-                self.carrot_path.append((r, c))
+                if (r, c) not in self.walls:
+                    self.carrot_path.append((r, c))
 
         if self.carrot_pos in self.carrot_path:
             self.carrot_idx = self.carrot_path.index(self.carrot_pos)
@@ -348,7 +351,8 @@ class HardLevel(Level):
         for r in range(self.grid_size):
             cols = range(self.grid_size) if r % 2 == 0 else range(self.grid_size - 1, -1, -1)
             for c in cols:
-                self.carrot_path.append((r, c))
+                if (r, c) not in self.walls:
+                    self.carrot_path.append((r, c))
 
         if self.carrot_pos in self.carrot_path:
             self.carrot_idx = self.carrot_path.index(self.carrot_pos)
@@ -460,9 +464,11 @@ class Renderer:
         self.font_big   = pygame.font.SysFont("monospace", 18, bold=True)
         self.font_med   = pygame.font.SysFont("monospace", 14)
         self.font_small = pygame.font.SysFont("monospace", 11)
+        _assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
         # load carrot sprite
         try:
-            _carrot_raw = pygame.image.load("carrot.PNG").convert_alpha()
+            _carrot_raw = pygame.image.load(os.path.join(_assets_dir, "carrot.PNG")).convert_alpha()
             _size = int(cell_size * 1.2)
             self.carrot_img = pygame.transform.smoothscale(
                 _carrot_raw, (_size, _size))
@@ -471,7 +477,7 @@ class Renderer:
 
         # load bunny sprite
         try:
-            _bunny_raw = pygame.image.load("bunny.PNG").convert_alpha()
+            _bunny_raw = pygame.image.load(os.path.join(_assets_dir, "bunny.png")).convert_alpha()
             _size = int(cell_size * 1.2)
             self.bunny_img = pygame.transform.smoothscale(
                 _bunny_raw, (_size, _size))
@@ -480,7 +486,7 @@ class Renderer:
 
         # load wolf sprite
         try:
-            _wolf_raw = pygame.image.load("wolf.PNG").convert_alpha()
+            _wolf_raw = pygame.image.load(os.path.join(_assets_dir, "wolf.PNG")).convert_alpha()
             _size = int(cell_size * 1.2)
             self.wolf_img = pygame.transform.smoothscale(
                 _wolf_raw, (_size, _size))
@@ -649,6 +655,7 @@ class Trainer:
         self.successful_episodes = 0
         self.success_steps = []
         self.training_time = 0.0
+        self.episode_outcomes = []  # (success: 0/1, steps_taken) per episode, parallel to episode_history
 
     def _handle_events(self):
         for event in pygame.event.get():
@@ -666,9 +673,10 @@ class Trainer:
     def train(self):
         """Run per-level episodes, rendering live."""
         train_episodes = getattr(self.level, 'EPISODES', TRAIN_EPISODES_EASY)
+        level_max_steps = getattr(self.level, 'max_steps', SAFETY_STEP_CAP)
         print(f"\n{'='*50}")
         print(f"  Training: {self.level_name}")
-        print(f"  Episodes: {train_episodes}  |  Max steps: {MAX_STEPS}")
+        print(f"  Episodes: {train_episodes}  |  Max steps: {level_max_steps}")
         print(f"{'='*50}")
 
         self.renderer.mode_text = "TRAINING"
@@ -678,7 +686,7 @@ class Trainer:
             state = self.level.reset()
             total_reward = 0.0
 
-            for step in range(MAX_STEPS):
+            for step in range(SAFETY_STEP_CAP):
                 if not self._handle_events():
                     return  # user closed window
 
@@ -705,10 +713,16 @@ class Trainer:
                 #     self.renderer.draw(self.agent)
 
                 if done:
-                    if reward > 0:
+                    is_success = reward > 0
+                    if is_success:
                         self.successful_episodes += 1
                         self.success_steps.append(step + 1)
+                    self.episode_outcomes.append((1 if is_success else 0, step + 1))
                     break
+            else:
+                # Loop exhausted SAFETY_STEP_CAP without done firing (should not
+                # normally happen, since each level enforces its own max_steps).
+                self.episode_outcomes.append((0, SAFETY_STEP_CAP))
 
             self.agent.decay_epsilon()
             self.renderer.episode_history.append((ep, total_reward))
@@ -723,11 +737,28 @@ class Trainer:
 
         self.training_time = time.time() - start_time
 
-        with open(f"{self.level_name.replace(' ','_')}_results.csv", "w", newline="") as f:
+        SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+        RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+
+        results_path = os.path.join(RESULTS_DIR, f"{self.level_name.replace(' ','_')}_results.csv")
+        with open(results_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Episode","Reward"])
-            for ep_num, rew in self.renderer.episode_history:
-                writer.writerow([ep_num, rew])
+            writer.writerow(["Episode", "Reward", "Success", "Steps"])
+            for (ep_num, rew), (success, steps) in zip(self.renderer.episode_history, self.episode_outcomes):
+                writer.writerow([ep_num, rew, success, steps])
+
+        # Separate one-row summary file for run-level metrics (not per-episode, so it
+        # doesn't belong in the same CSV shape as the per-episode results above).
+        success_rate = (self.successful_episodes / train_episodes) * 100
+        avg_success_steps = float(np.mean(self.success_steps)) if self.success_steps else None
+        summary_path = os.path.join(RESULTS_DIR, f"{self.level_name.replace(' ','_')}_summary.csv")
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Episodes", "BestReward", "SuccessRate", "AvgStepsToSuccess", "TrainingTimeSeconds"])
+            writer.writerow([train_episodes, self.best_policy_reward, round(success_rate, 2),
+                              round(avg_success_steps, 2) if avg_success_steps is not None else "",
+                              round(self.training_time, 2)])
 
         print(f"\n  Training complete. Best reward: {self.best_policy_reward:.1f}")
         print(f"  Success Rate: {(self.successful_episodes/train_episodes)*100:.2f}%")
@@ -754,7 +785,7 @@ class Trainer:
             total_reward = 0.0
             print(f"    Replay run {run+1}/{REPLAY_EPISODES}", end="", flush=True)
 
-            for step in range(MAX_STEPS):
+            for step in range(SAFETY_STEP_CAP):
                 if not self._handle_events():
                     break
 
